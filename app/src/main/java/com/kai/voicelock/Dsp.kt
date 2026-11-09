@@ -98,6 +98,41 @@ object Dsp {
         return 10.0 * log10(sum / frame.size + 1e-12)
     }
 
+    /** One MFCC frame from a 25 ms window starting at [offset]. No CMN (caller handles it). */
+    fun mfccFrame(samples: ShortArray, offset: Int): DoubleArray {
+        val re = DoubleArray(FFT_SIZE)
+        val im = DoubleArray(FFT_SIZE)
+        val power = DoubleArray(FFT_SIZE / 2 + 1)
+
+        var prev = if (offset > 0) samples[offset - 1].toDouble() else 0.0
+        for (j in 0 until FRAME_LEN) {
+            val cur = samples[offset + j].toDouble()
+            re[j] = (cur - 0.97 * prev) * hamming[j]
+            prev = cur
+        }
+
+        fft(re, im)
+        for (k in power.indices) power[k] = re[k] * re[k] + im[k] * im[k]
+
+        val mel = DoubleArray(MEL_BANDS)
+        for (b in 0 until MEL_BANDS) {
+            var sum = 0.0
+            val filter = melFilters[b]
+            for (k in power.indices) sum += power[k] * filter[k]
+            mel[b] = ln(sum + 1e-10)
+        }
+
+        val out = DoubleArray(CEPSTRA)
+        for (c in 0 until CEPSTRA) {
+            var sum = 0.0
+            for (b in 0 until MEL_BANDS) {
+                sum += mel[b] * cos(PI * c * (b + 0.5) / MEL_BANDS)
+            }
+            out[c] = sum
+        }
+        return out
+    }
+
     private fun fft(re: DoubleArray, im: DoubleArray) {
         val n = re.size
         var j = 0

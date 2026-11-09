@@ -10,11 +10,15 @@ import android.content.Intent
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -27,8 +31,13 @@ import kotlinx.coroutines.launch
 
 /**
  * Always-on foreground listener.
- * Pipeline: AudioRecord 16 kHz -> VAD segmenter -> MFCC -> DTW against enrolled templates.
- * No ASR, so the phrase can be anything and the trigger lands ~200 ms after you stop talking.
+ *
+ * Fast path (instant): MFCC is computed per 10 ms frame while you speak and a streaming
+ * DTW row is kept per enrolled template. As soon as the template is aligned the screen
+ * locks — no waiting for silence.
+ *
+ * Safety path (full): when the VAD closes an utterance (150 ms silence), a full DTW +
+ * pitch check runs as a fallback for slower/faster deliveries the streaming gate missed.
  */
 class VoiceLockService : Service() {
 
@@ -37,6 +46,7 @@ class VoiceLockService : Service() {
         const val ACTION_STOP = "com.kai.voicelock.STOP"
         private const val CHANNEL_ID = "voice_lock"
         private const val NOTIF_ID = 42
+        private const val COOLDOWN_MS = 1800L
 
         @Volatile
         var running: Boolean = false
@@ -110,7 +120,7 @@ class VoiceLockService : Service() {
                 Dsp.SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,
-                maxOf(minBuf * 2, 8192)
+                maxOf(minBuf * 2, 4096)
             )
             if (record.state != AudioRecord.STATE_INITIALIZED) {
                 throw IllegalStateException("AudioRecord initialize nahi hua")
@@ -119,6 +129,9 @@ class VoiceLockService : Service() {
 
             val segmenter = Segmenter()
             val frame = ShortArray(Segmenter.FRAME_SAMPLES)
+            var streamMfcc: StreamingMfcc? = null
+            var streamMatcher: StreamingMatcher? = null
+            var gain = 1f
 
             while (running) {
                 var read = 0
@@ -129,14 +142,45 @@ class VoiceLockService : Service() {
                 }
                 if (read < frame.size) continue
 
-                val utterance = segmenter.push(frame) ?: continue
-                val model = Enrollment.load(this) ?: continue
-                val result = VoiceMatcher.match(
-                    model,
-                    utterance,
-                    Prefs.sensitivityFactor(this)
-                )
-                if (result.accepted) trigger(result.distance)
+                if (!segmenter.activeNow) {
+                    gain = if (Prefs.farMode(this)) 2.5f else 1f
+                }
+                AudioCapture.applyGain(frame, gain)
+
+                val wasActive = segmenter.activeNow
+                val utterance = segmenter.push(frame)
+                val nowActive = segmenter.activeNow
+
+                if (!wasActive && nowActive) {
+                    val model = Enrollment.load(this)
+                    if (model != null) {
+                        streamMfcc = StreamingMfcc()
+                        streamMatcher = StreamingMatcher(model, Prefs.sensitivityFactor(this))
+                    }
+                }
+
+                if (nowActive && streamMfcc != null && streamMatcher != null) {
+                    val feat = streamMfcc.push(frame)
+                    if (feat != null && streamMatcher.push(feat)) {
+                        performLock("instant", streamMatcher.threshold)
+                        segmenter.reset()
+                        streamMfcc = null
+                        streamMatcher = null
+                        continue
+                    }
+                }
+
+                if (utterance != null) {
+                    streamMfcc = null
+                    streamMatcher = null
+                    val model = Enrollment.load(this) ?: continue
+                    val result = VoiceMatcher.match(model, utterance, Prefs.sensitivityFactor(this))
+                    if (result.accepted) {
+                        performLock("full", result.threshold, result.distance)
+                    } else {
+                        EventLog.add("REJECT  score ${fmt(result.distance)} / ${fmt(result.threshold)}")
+                    }
+                }
             }
         } catch (t: Throwable) {
             notify("Mic band ho gaya: ${t.message ?: t.javaClass.simpleName}")
@@ -148,25 +192,44 @@ class VoiceLockService : Service() {
         }
     }
 
-    private fun trigger(score: Double) {
+    private fun performLock(source: String, threshold: Double, score: Double = -1.0) {
         val now = SystemClock.elapsedRealtime()
-        if (now - lastTrigger < 2500L) return
+        if (now - lastTrigger < COOLDOWN_MS) return
         lastTrigger = now
 
         Handler(Looper.getMainLooper()).post {
+            val t0 = SystemClock.elapsedRealtime()
             val locked = LockController.lock(this)
+            val actionMs = SystemClock.elapsedRealtime() - t0
+            vibrate()
+            val detail = if (score >= 0) "score ${fmt(score)}/${fmt(threshold)}" else "threshold ${fmt(threshold)}"
             if (locked) {
-                Toast.makeText(this, "Locked ✅", Toast.LENGTH_SHORT).show()
-                notify("Locked — sun raha hoon…")
+                Toast.makeText(this, "Locked ✅ ${actionMs}ms", Toast.LENGTH_SHORT).show()
+                EventLog.add("MATCH ($source) • $detail • action ${actionMs}ms ✅")
+                notify("Locked • sun raha hoon…")
             } else {
-                Toast.makeText(
-                    this,
-                    "Lock permission nahi mili — Accessibility ya Device Admin on karo",
-                    Toast.LENGTH_LONG
-                ).show()
+                EventLog.add("MATCH ($source) • $detail • lock FAIL (permission)")
+                notify("Lock fail — Accessibility/Admin on karo")
             }
         }
     }
+
+    private fun vibrate() {
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 31) {
+                val vm = getSystemService(VibratorManager::class.java) ?: return
+                vm.defaultVibrator.vibrate(
+                    VibrationEffect.createOneShot(60, VibrationEffect.DEFAULT_AMPLITUDE)
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                getSystemService(Vibrator::class.java)
+                    ?.vibrate(VibrationEffect.createOneShot(60, VibrationEffect.DEFAULT_AMPLITUDE))
+            }
+        }
+    }
+
+    private fun fmt(value: Double): String = String.format(java.util.Locale.US, "%.3f", value)
 
     private fun shutdown() {
         running = false
@@ -243,7 +306,7 @@ class VoiceLockService : Service() {
 
     @Suppress("DEPRECATION")
     private fun stopForegroundCompat() {
-        if (android.os.Build.VERSION.SDK_INT >= 24) {
+        if (Build.VERSION.SDK_INT >= 24) {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } else {
             stopForeground(true)

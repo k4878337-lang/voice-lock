@@ -23,6 +23,9 @@ class Segmenter {
     private val preRoll = ArrayDeque<ShortArray>()
     private var segment = ArrayList<ShortArray>()
     private var active = false
+
+    val activeNow: Boolean
+        get() = active
     private var speechRun = 0
     private var silenceRun = 0
     private var noiseDb = -65.0

@@ -1,74 +1,73 @@
-# VoiceLock v2
+# VoiceLock v2.1
 
-Apni awaaz se phone lock karo. Phrase koi bhi ho — pehle 3 baar record karo, phir wahi phrase bolne par screen lock ho jayegi. Sab on-device, koi internet nahi, koi model download nahi.
+Apni awaaz se phone lock karo. Phrase koi bhi ho — 3 baar record karo, phir wahi phrase bolne par turant lock. Sab on-device, koi internet nahi, koi model download nahi.
 
-## Kya badla v1 se
+## v2.1 me naya
 
-| v1 | v2 |
-|---|---|
-| Fixed phrases (`lock phone`) | **Koi bhi phrase** — tumhari recording se enroll hota hai |
-| Vosk ASR (40 MB model, 1–2s latency) | **MFCC + DTW** template matching, ~0.3–0.5s latency |
-| Text matching, koi speaker check nahi | **Sirf tumhari awaaz** — DTW + pitch check |
-| Model download chahiye | Kuch download nahi, poora offline |
-| Background me bhaari | Halka DSP loop, foreground service + wake lock |
+- **Streaming match (instant mode)** — bolte-bolte hi MFCC frames bante hain aur streaming DTW template se align karta hai. Silence ka intezaar nahi. Trigger target **<150 ms** phrase ke last word ke baad.
+- **Far mode** — `MIC` + 2.5× software gain + lower VAD threshold. Door se bolne ke liye.
+- **Event log** — last 6 events app me: MATCH / REJECT + score + lock action time. Pata chalta hai app sun raha hai ya nahi.
+- **Vibration + toast** — lock hote hi confirm.
+- **Fast fallback** — streaming miss ho jaye to 150 ms silence par full DTW + pitch check chalta hai.
 
 ## Kaise kaam karta hai
 
-1. **Enrollment** — tum apna phrase 3 baar bolte ho. Har recording ka MFCC (voice fingerprint) nikal ke save hota hai. App ko phrase ka matlab samajhna hi nahi padta — "Sagar mobile band karo" bhi utna hi valid hai jitna "lock".
-2. **Auto threshold** — teen samples ke aapas ke DTW distance se threshold khud calibrate hota hai.
-3. **Detection** — service 10 ms frames padhti hai, VAD se bolna shuru hone par segment banata hai, 200 ms silence par phrase khatam maanta hai, phir MFCC + DTW compare. Match = lock.
-4. **Sirf tumhari awaaz** — DTW template distance + mean pitch check. Doosra banda wahi phrase bole to score threshold se bahar rehta hai.
-5. **Lock** — AccessibilityService `GLOBAL_ACTION_LOCK_SCREEN` (Android 9+), fallback DeviceAdmin `lockNow()`.
+```
+mic 16kHz → 10ms frames → VAD → [streaming MFCC + DTW] → lock (instant)
+                                  ↘ utterance end → full DTW + pitch → lock (fallback)
+```
+
+- **Enrollment**: 3 recordings → MFCC templates + auto threshold.
+- **Speaker check**: DTW template distance (voice timbre + phrase) + mean pitch. Doosri awaaz ka score threshold ke bahar rehta hai.
+- **Lock**: Accessibility `GLOBAL_ACTION_LOCK_SCREEN` (Android 9+), fallback DeviceAdmin `lockNow()`.
 
 ## Setup
 
-1. APK install karo.
-2. App kholo → mic permission do.
-3. **Record sample 1/3** → apna phrase bolo (jaise "Sagar mobile band karo").
-4. Wahi phrase 2 aur baar record karo — **same phrase, same tone**.
-5. **Test phrase** dabao — score aur MATCH/no-match dikhega. Match na aaye to sensitivity badhao.
-6. **Accessibility ON** karo (recommended).
-7. **Battery optimization exempt** karo — background me zinda rehne ke liye zaroori.
-8. **Start listening**.
+1. APK install karo (v1/v2 hai to pehle uninstall).
+2. Mic permission do.
+3. **Record sample 1/3 → 2/3 → 3/3** — har baar wahi phrase, jaise `Sagar mobile band karo`.
+4. **Test phrase** → score dekho:
+   - `MATCH ✅` = sahi
+   - `no match ❌` = sensitivity thoda badhao
+5. Door se bolna hai to **Far mode ON** karo (phir dobara enroll karna better hai, kyunki enrollment aur detection ka gain same hona chahiye).
+6. **Accessibility ON**, **Battery exempt**, **Start listening**.
 
-Ab koi bhi app khula ho — YouTube, browser, game — screen off ho ya on — phrase bolne par lock ho jayega.
+Ab kisi bhi app ke upar, screen off hone par bhi, phrase bolne par lock.
 
-## Sensitivity
+## Tuning
 
-Slider 0–100, default 50 (= 1.0× auto threshold).
-
-- **Kam (strict)** — galti se lock nahi hoga, par kabhi kabhi tumhara phrase miss ho sakta hai.
-- **Zyada (loose)** — pakad achhi, par similar awaaz/phrase false trigger kar sakta hai.
-
-Test button se score dekho: `score` limit se kam hona chahiye.
+- **Sensitivity** (0–100, default 50): zyada = loose (jaldi match, false trigger risk), kam = strict.
+- **Far mode**: 1–2 meter tak realistic. Phone ka mic hi limit hai — software gain SNR nahi bana sakta.
+- **Event log**: `REJECT` aa raha hai to app sun raha hai par match nahi hua — sensitivity ya dobara enrollment.
+- Kuch bhi event nahi aa raha = mic/VAD issue — Far mode try karo.
 
 ## Limits (sach)
 
-- **Voice-print-lite hai, biometric nahi.** Bahut similar awaaz ya voice clone se bypass ho sakta hai. Casual "sirf mera phone" level ke liye kaafi.
-- **Unlock voice se nahi** — Android secure keyguard kisi app se programmatically dismiss nahi hota. Voice sirf lock karti hai.
-- **Battery** — continuous listening ~5–8%/din. Mic indicator (green dot) dikhega.
-- **OEM killers** — Xiaomi/Oppo/Vivo/Realme me autostart permission manually on karni padegi, warna service mar jayegi.
-- **Android 14+** — reboot ke baad mic foreground service background se start nahi hoti; app ek baar kholni padegi.
-- **Phrase change** — naya phrase = dobara 3 samples record karo.
+- **1 ms possible nahi** — 10–20 ms mic buffering + VAD + Android lock IPC. Realistic best **~50–150 ms**.
+- **Voice-print-lite, biometric nahi** — bahut similar awaaz bypass kar sakti hai.
+- **Unlock voice se nahi** — Android secure keyguard kisi app se dismiss nahi hota.
+- **Battery** — continuous listening ~5–8%/din.
+- **OEM killers** — Xiaomi/Oppo/Vivo/Realme me autostart permission manually on karo.
+- **Android 14+** — reboot ke baad app ek baar kholni padegi.
 
 ## Build
 
-GitHub Actions: push → **Build APK** → artifact download.
-
-Local: JDK 17 + Android SDK 34 + Gradle 8.7, phir `gradle assembleDebug`.
+GitHub Actions: push → **Build APK** → artifact. Local: JDK 17 + SDK 34 + Gradle 8.7 → `gradle assembleDebug`.
 
 ## Structure
 
 ```
 app/src/main/java/com/kai/voicelock/
-├── MainActivity.kt       # enrollment + test + permissions
-├── VoiceLockService.kt   # foreground listener, mic loop, lock trigger
+├── MainActivity.kt       # enrollment, test, sensitivity, far mode, event log
+├── VoiceLockService.kt   # capture loop, streaming + fallback, lock trigger
+├── StreamingMatch.kt     # streaming MFCC + streaming DTW (instant path)
 ├── Segmenter.kt          # VAD, adaptive noise floor
 ├── Dsp.kt                # FFT, mel filterbank, MFCC, CMN
-├── VoiceMatch.kt         # DTW + pitch + match decision
+├── VoiceMatch.kt         # batch DTW + pitch + match decision
 ├── Enrollment.kt         # templates + threshold storage
-├── AudioCapture.kt       # one-shot enrollment recording
-├── LockController.kt     # accessibility / device admin lock
+├── AudioCapture.kt       # enrollment recording + gain
+├── EventLog.kt
+├── LockController.kt
 ├── LockAccessibilityService.kt
 ├── AdminReceiver.kt
 ├── BootReceiver.kt

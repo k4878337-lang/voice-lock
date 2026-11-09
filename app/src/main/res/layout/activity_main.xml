@@ -78,6 +78,13 @@
             android:layout_height="wrap_content"
             android:max="100" />
 
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/farSwitch"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Far mode (door se bolne ke liye — mic gain 2.5x)" />
+
         <Button
             android:id="@+id/btnStart"
             android:layout_width="match_parent"
@@ -115,6 +122,22 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="Battery optimization se exempt karo" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:text="Last events (proof ki app sun raha hai)"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/eventLog"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:fontFamily="monospace"
+            android:textSize="12sp"
+            android:text="Abhi koi event nahi" />
 
         <TextView
             android:layout_width="match_parent"

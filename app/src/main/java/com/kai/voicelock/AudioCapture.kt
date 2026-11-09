@@ -7,7 +7,7 @@ import android.media.MediaRecorder
 object AudioCapture {
 
     /** Records one utterance (VAD-trimmed) or null on timeout/error. Blocking — call off the main thread. */
-    fun recordPhrase(maxMs: Int = 4500): ShortArray? {
+    fun recordPhrase(maxMs: Int = 4500, gain: Float = 1f): ShortArray? {
         val minBuf = AudioRecord.getMinBufferSize(
             Dsp.SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
@@ -42,6 +42,7 @@ object AudioCapture {
                     read += n
                 }
                 frames++
+                applyGain(frame, gain)
                 segmenter.push(frame)?.let { return it }
             }
             return null
@@ -50,6 +51,14 @@ object AudioCapture {
         } finally {
             runCatching { record.stop() }
             record.release()
+        }
+    }
+
+    fun applyGain(frame: ShortArray, gain: Float) {
+        if (gain == 1f) return
+        for (i in frame.indices) {
+            val v = (frame[i] * gain).toInt()
+            frame[i] = v.coerceIn(-32768, 32767).toShort()
         }
     }
 }

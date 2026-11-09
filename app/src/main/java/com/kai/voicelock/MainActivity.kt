@@ -18,6 +18,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.SwitchCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
@@ -38,6 +39,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnStart: Button
     private lateinit var btnStop: Button
     private lateinit var sensitivityBar: SeekBar
+    private lateinit var farSwitch: SwitchCompat
+    private lateinit var eventLog: TextView
 
     private val samples = mutableListOf<Array<DoubleArray>>()
     private val pitches = mutableListOf<Double>()
@@ -67,6 +70,14 @@ class MainActivity : AppCompatActivity() {
         btnStart = findViewById(R.id.btnStart)
         btnStop = findViewById(R.id.btnStop)
         sensitivityBar = findViewById(R.id.sensitivityBar)
+        farSwitch = findViewById(R.id.farSwitch)
+        eventLog = findViewById(R.id.eventLog)
+
+        farSwitch.isChecked = Prefs.farMode(this)
+        farSwitch.setOnCheckedChangeListener { _, checked ->
+            Prefs.setFarMode(this, checked)
+            toast(if (checked) "Far mode ON — gain 2.5x" else "Far mode OFF")
+        }
 
         sensitivityBar.progress = Prefs.sensitivityProgress(this)
         sensitivityLabel.text = sensitivityText(sensitivityBar.progress)
@@ -159,6 +170,16 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         model = Enrollment.load(this)
         updateUi()
+        updateEventLog()
+    }
+
+    private fun updateEventLog() {
+        val lines = EventLog.snapshot()
+        eventLog.text = if (lines.isEmpty()) {
+            "Abhi koi event nahi — Start listening ke baad yahan dikhega"
+        } else {
+            lines.joinToString("\n")
+        }
     }
 
     // --- enrollment ---
@@ -170,7 +191,9 @@ class MainActivity : AppCompatActivity() {
         enrollStatus.text = "Ab bolo… (sample ${samples.size + 1}/3)"
 
         lifecycleScope.launch {
-            val pcm = withContext(Dispatchers.IO) { AudioCapture.recordPhrase() }
+            val pcm = withContext(Dispatchers.IO) {
+                AudioCapture.recordPhrase(gain = if (Prefs.farMode(this@MainActivity)) 2.5f else 1f)
+            }
             if (pcm == null) {
                 busy = false
                 updateUi()
@@ -227,7 +250,9 @@ class MainActivity : AppCompatActivity() {
         enrollStatus.text = "Test — ab bolo…"
 
         lifecycleScope.launch {
-            val pcm = withContext(Dispatchers.IO) { AudioCapture.recordPhrase() }
+            val pcm = withContext(Dispatchers.IO) {
+                AudioCapture.recordPhrase(gain = if (Prefs.farMode(this@MainActivity)) 2.5f else 1f)
+            }
             val result = if (pcm == null) {
                 null
             } else {
