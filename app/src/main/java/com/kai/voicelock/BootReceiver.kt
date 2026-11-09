@@ -8,7 +8,7 @@ import android.util.Log
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (!Prefs.wantsRunning(context)) return
-        if (!Prefs.hasModel(context)) return
+        if (!Enrollment.exists(context)) return
         try {
             VoiceLockService.start(context)
         } catch (t: Throwable) {

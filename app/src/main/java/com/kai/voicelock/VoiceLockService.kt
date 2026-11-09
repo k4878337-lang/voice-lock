@@ -24,10 +24,12 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import org.json.JSONObject
-import org.vosk.Model
-import org.vosk.Recognizer
 
+/**
+ * Always-on foreground listener.
+ * Pipeline: AudioRecord 16 kHz -> VAD segmenter -> MFCC -> DTW against enrolled templates.
+ * No ASR, so the phrase can be anything and the trigger lands ~200 ms after you stop talking.
+ */
 class VoiceLockService : Service() {
 
     companion object {
@@ -66,8 +68,8 @@ class VoiceLockService : Service() {
             shutdown()
             return START_NOT_STICKY
         }
-        if (!Prefs.hasModel(this)) {
-            Toast.makeText(this, "Voice model download karo pehle", Toast.LENGTH_LONG).show()
+        if (!Enrollment.exists(this)) {
+            Toast.makeText(this, "Pehle phrase enroll karo (3 samples)", Toast.LENGTH_LONG).show()
             shutdown()
             return START_NOT_STICKY
         }
@@ -81,7 +83,6 @@ class VoiceLockService : Service() {
         try {
             startForeground(NOTIF_ID, buildNotification("Sun raha hoon…"))
         } catch (t: Throwable) {
-            // Android 14+ rejects mic-type foreground service without permission/exemption.
             Toast.makeText(this, "Foreground service start nahi hui: ${t.message}", Toast.LENGTH_LONG).show()
             shutdown()
             return START_NOT_STICKY
@@ -96,14 +97,9 @@ class VoiceLockService : Service() {
 
     private fun listen() {
         var record: AudioRecord? = null
-        var model: Model? = null
-        var recognizer: Recognizer? = null
         try {
-            model = Model(Prefs.modelDir(this).absolutePath)
-            recognizer = Recognizer(model, 16000.0f)
-
             val minBuf = AudioRecord.getMinBufferSize(
-                16000,
+                Dsp.SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT
             )
@@ -111,7 +107,7 @@ class VoiceLockService : Service() {
 
             record = AudioRecord(
                 MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                16000,
+                Dsp.SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,
                 maxOf(minBuf * 2, 8192)
@@ -121,47 +117,45 @@ class VoiceLockService : Service() {
             }
             record.startRecording()
 
-            val buf = ShortArray(4096)
+            val segmenter = Segmenter()
+            val frame = ShortArray(Segmenter.FRAME_SAMPLES)
+
             while (running) {
-                val n = record.read(buf, 0, buf.size)
-                if (n <= 0) continue
-                val phrases = Prefs.phrases(this)
-                if (recognizer.acceptWaveForm(buf, n)) {
-                    checkText(recognizer.result, phrases)
-                } else {
-                    checkText(recognizer.partialResult, phrases)
+                var read = 0
+                while (read < frame.size) {
+                    val n = record.read(frame, read, frame.size - read)
+                    if (n <= 0) break
+                    read += n
                 }
+                if (read < frame.size) continue
+
+                val utterance = segmenter.push(frame) ?: continue
+                val model = Enrollment.load(this) ?: continue
+                val result = VoiceMatcher.match(
+                    model,
+                    utterance,
+                    Prefs.sensitivityFactor(this)
+                )
+                if (result.accepted) trigger(result.distance)
             }
         } catch (t: Throwable) {
-            notify("Voice engine band: ${t.message ?: t.javaClass.simpleName}")
+            notify("Mic band ho gaya: ${t.message ?: t.javaClass.simpleName}")
             Handler(Looper.getMainLooper()).post { shutdown() }
         } finally {
             running = false
             runCatching { record?.stop() }
             runCatching { record?.release() }
-            runCatching { recognizer?.close() }
-            runCatching { model?.close() }
         }
     }
 
-    private fun checkText(json: String, phrases: List<String>) {
-        val text = runCatching {
-            val obj = JSONObject(json)
-            if (obj.has("partial")) obj.optString("partial") else obj.optString("text")
-        }.getOrDefault("")
-        if (text.isBlank()) return
-        val hit = phrases.firstOrNull { PhraseMatcher.matches(text, it) }
-        if (hit != null) trigger(hit)
-    }
-
-    private fun trigger(phrase: String) {
+    private fun trigger(score: Double) {
         val now = SystemClock.elapsedRealtime()
-        if (now - lastTrigger < 3000L) return
+        if (now - lastTrigger < 2500L) return
         lastTrigger = now
 
         Handler(Looper.getMainLooper()).post {
-            val ok = LockController.lock(this)
-            if (ok) {
+            val locked = LockController.lock(this)
+            if (locked) {
                 Toast.makeText(this, "Locked ✅", Toast.LENGTH_SHORT).show()
                 notify("Locked — sun raha hoon…")
             } else {

@@ -7,31 +7,19 @@ object Prefs {
 
     private fun sp(ctx: Context) = ctx.getSharedPreferences(FILE, Context.MODE_PRIVATE)
 
-    fun phrases(ctx: Context): List<String> =
-        sp(ctx).getString("phrases", "lock phone")
-            ?.split(",")
-            ?.map { it.trim() }
-            ?.filter { it.isNotEmpty() }
-            ?: listOf("lock phone")
-
-    fun setPhrases(ctx: Context, raw: String) {
-        val cleaned = raw.split(",").map { it.trim() }.filter { it.isNotEmpty() }.joinToString(", ")
-        sp(ctx).edit().putString("phrases", cleaned.ifEmpty { "lock phone" }).apply()
-    }
-
-    fun lang(ctx: Context): String = sp(ctx).getString("lang", "en") ?: "en"
-    fun setLang(ctx: Context, value: String) {
-        sp(ctx).edit().putString("lang", value).apply()
-    }
-
     fun wantsRunning(ctx: Context): Boolean = sp(ctx).getBoolean("wants_running", false)
+
     fun setWantsRunning(ctx: Context, value: Boolean) {
         sp(ctx).edit().putBoolean("wants_running", value).apply()
     }
 
-    fun modelDir(ctx: Context) = java.io.File(ctx.filesDir, "model")
-    fun hasModel(ctx: Context): Boolean {
-        val dir = modelDir(ctx)
-        return dir.isDirectory && java.io.File(dir, "conf").exists()
+    /** 0..100 user-facing slider. 50 = 1.0x auto threshold. */
+    fun sensitivityProgress(ctx: Context): Int = sp(ctx).getInt("sensitivity", 50)
+
+    fun setSensitivityProgress(ctx: Context, value: Int) {
+        sp(ctx).edit().putInt("sensitivity", value.coerceIn(0, 100)).apply()
     }
+
+    fun sensitivityFactor(ctx: Context): Float =
+        0.7f + sensitivityProgress(ctx) / 100f * 0.6f
 }

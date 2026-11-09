@@ -13,31 +13,42 @@ import android.os.PowerManager
 import android.provider.Settings
 import android.view.accessibility.AccessibilityManager
 import android.widget.Button
-import android.widget.EditText
-import android.widget.RadioGroup
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.Locale
+import kotlin.math.max
+import kotlin.math.sqrt
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var statusText: TextView
-    private lateinit var phraseInput: EditText
-    private lateinit var modelStatus: TextView
-    private lateinit var progressText: TextView
-    private lateinit var downloadBtn: Button
-    private lateinit var langGroup: RadioGroup
+    private lateinit var enrollStatus: TextView
+    private lateinit var sensitivityLabel: TextView
+    private lateinit var btnRecord: Button
+    private lateinit var btnTest: Button
+    private lateinit var btnClear: Button
+    private lateinit var btnStart: Button
+    private lateinit var btnStop: Button
+    private lateinit var sensitivityBar: SeekBar
 
-    private var downloading = false
+    private val samples = mutableListOf<Array<DoubleArray>>()
+    private val pitches = mutableListOf<Double>()
+    private var model: Enrollment.Model? = null
+    private var busy = false
+    private var afterPermission: (() -> Unit)? = null
 
     private val micPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) ensureNotificationThenStart()
-            else toast("Mic permission ke bina sun nahi sakta")
+            if (granted) afterPermission?.invoke() else toast("Microphone permission chahiye")
+            afterPermission = null
         }
 
     private val notificationPermission =
@@ -48,35 +59,73 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         statusText = findViewById(R.id.statusText)
-        phraseInput = findViewById(R.id.phraseInput)
-        modelStatus = findViewById(R.id.modelStatus)
-        progressText = findViewById(R.id.progressText)
-        downloadBtn = findViewById(R.id.downloadBtn)
-        langGroup = findViewById(R.id.langGroup)
+        enrollStatus = findViewById(R.id.enrollStatus)
+        sensitivityLabel = findViewById(R.id.sensitivityLabel)
+        btnRecord = findViewById(R.id.btnRecord)
+        btnTest = findViewById(R.id.btnTest)
+        btnClear = findViewById(R.id.btnClear)
+        btnStart = findViewById(R.id.btnStart)
+        btnStop = findViewById(R.id.btnStop)
+        sensitivityBar = findViewById(R.id.sensitivityBar)
 
-        phraseInput.setText(Prefs.phrases(this).joinToString(", "))
-        if (Prefs.lang(this) == "hi") langGroup.check(R.id.langHi) else langGroup.check(R.id.langEn)
+        sensitivityBar.progress = Prefs.sensitivityProgress(this)
+        sensitivityLabel.text = sensitivityText(sensitivityBar.progress)
+        sensitivityBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(bar: SeekBar?, progress: Int, fromUser: Boolean) {
+                sensitivityLabel.text = sensitivityText(progress)
+                if (fromUser) Prefs.setSensitivityProgress(this@MainActivity, progress)
+            }
 
-        findViewById<Button>(R.id.btnStart).setOnClickListener {
-            savePhrases()
-            if (!Prefs.hasModel(this)) {
-                toast("Pehle voice model download karo")
-                return@setOnClickListener
+            override fun onStartTrackingTouch(bar: SeekBar?) = Unit
+            override fun onStopTrackingTouch(bar: SeekBar?) = Unit
+        })
+
+        btnRecord.setOnClickListener {
+            withMic {
+                if (busy) return@withMic
+                if (model != null) {
+                    Enrollment.clear(this)
+                    model = null
+                }
+                if (samples.size >= 3) {
+                    samples.clear()
+                    pitches.clear()
+                }
+                recordSample()
             }
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-                != PackageManager.PERMISSION_GRANTED
-            ) {
-                micPermission.launch(Manifest.permission.RECORD_AUDIO)
-                return@setOnClickListener
-            }
-            ensureNotificationThenStart()
         }
 
-        findViewById<Button>(R.id.btnStop).setOnClickListener {
+        btnTest.setOnClickListener {
+            val m = model
+            if (m == null) {
+                toast("Pehle 3 samples enroll karo")
+                return@setOnClickListener
+            }
+            withMic { testPhrase(m) }
+        }
+
+        btnClear.setOnClickListener {
+            Enrollment.clear(this)
+            model = null
+            samples.clear()
+            pitches.clear()
+            updateUi()
+            toast("Enrollment clear ho gaya")
+        }
+
+        btnStart.setOnClickListener {
+            if (model == null) {
+                toast("Pehle 3 samples record karo")
+                return@setOnClickListener
+            }
+            withMic { ensureNotificationThenStart() }
+        }
+
+        btnStop.setOnClickListener {
             Prefs.setWantsRunning(this, false)
             VoiceLockService.stop(this)
             toast("Listening band")
-            refresh()
+            updateUi()
         }
 
         findViewById<Button>(R.id.btnAccessibility).setOnClickListener {
@@ -102,45 +151,101 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        downloadBtn.setOnClickListener { downloadModel() }
+        model = Enrollment.load(this)
+        updateUi()
     }
 
     override fun onResume() {
         super.onResume()
-        refresh()
+        model = Enrollment.load(this)
+        updateUi()
     }
 
-    private fun downloadModel() {
-        if (downloading) return
-        val hindi = langGroup.checkedRadioButtonId == R.id.langHi
-        Prefs.setLang(this, if (hindi) "hi" else "en")
-        val url = if (hindi) ModelDownloader.URL_HI else ModelDownloader.URL_EN
+    // --- enrollment ---
 
-        downloading = true
-        downloadBtn.isEnabled = false
-        progressText.text = "Download shuru…"
+    private fun recordSample() {
+        if (busy) return
+        busy = true
+        updateUi()
+        enrollStatus.text = "Ab bolo… (sample ${samples.size + 1}/3)"
+
         lifecycleScope.launch {
-            try {
-                ModelDownloader.download(this@MainActivity, url) { pct ->
-                    runOnUiThread { progressText.text = "Download: $pct%" }
+            val pcm = withContext(Dispatchers.IO) { AudioCapture.recordPhrase() }
+            if (pcm == null) {
+                busy = false
+                updateUi()
+                enrollStatus.text = "Kuch sunai nahi diya — phir bolo"
+                return@launch
+            }
+
+            val features = withContext(Dispatchers.Default) { VoiceMatch.prepare(pcm) }
+            val pitch = withContext(Dispatchers.Default) { VoiceMatch.pitchMean(pcm) }
+
+            if (features == null) {
+                busy = false
+                updateUi()
+                enrollStatus.text = "Clip bahut chhoti thi — poora phrase bolo"
+                return@launch
+            }
+
+            samples.add(features)
+            if (pitch != null) pitches.add(pitch)
+            busy = false
+
+            if (samples.size >= 3) finishEnrollment() else updateUi()
+        }
+    }
+
+    private fun finishEnrollment() {
+        var worst = 0.0
+        for (i in samples.indices) {
+            for (j in i + 1 until samples.size) {
+                worst = max(worst, VoiceMatch.distance(samples[i], samples[j]))
+            }
+        }
+        val threshold = (worst * 1.5).coerceIn(0.18, 0.55)
+        val meanPitch = if (pitches.size >= 2) pitches.average() else 0.0
+        val variance = if (pitches.size >= 2) {
+            pitches.sumOf { (it - meanPitch) * (it - meanPitch) } / pitches.size
+        } else {
+            0.0
+        }
+
+        val newModel = Enrollment.Model(samples.toList(), threshold, meanPitch, sqrt(variance))
+        Enrollment.save(this, newModel)
+        model = newModel
+        samples.clear()
+        pitches.clear()
+        toast("Enrolled ✅ ab test karo")
+        updateUi()
+    }
+
+    private fun testPhrase(m: Enrollment.Model) {
+        if (busy) return
+        busy = true
+        updateUi()
+        enrollStatus.text = "Test — ab bolo…"
+
+        lifecycleScope.launch {
+            val pcm = withContext(Dispatchers.IO) { AudioCapture.recordPhrase() }
+            val result = if (pcm == null) {
+                null
+            } else {
+                withContext(Dispatchers.Default) {
+                    VoiceMatcher.match(m, pcm, Prefs.sensitivityFactor(this@MainActivity))
                 }
-                progressText.text = if (hindi) {
-                    "Model ready ✅ (Hindi model Devanagari likhta hai — phrase Devanagari me daalo)"
-                } else {
-                    "Model ready ✅"
-                }
-            } catch (t: Throwable) {
-                progressText.text = "Download fail: ${t.message}"
-            } finally {
-                downloading = false
-                refresh()
+            }
+            busy = false
+            updateUi()
+            enrollStatus.text = if (result == null) {
+                "Kuch sunai nahi diya — phir test karo"
+            } else {
+                "Test: ${if (result.accepted) "MATCH ✅" else "no match ❌"}  •  score ${fmt(result.distance)} / limit ${fmt(result.threshold)}"
             }
         }
     }
 
-    private fun savePhrases() {
-        Prefs.setPhrases(this, phraseInput.text.toString())
-    }
+    // --- service / permissions ---
 
     private fun ensureNotificationThenStart() {
         if (Build.VERSION.SDK_INT >= 33 &&
@@ -157,11 +262,22 @@ class MainActivity : AppCompatActivity() {
         Prefs.setWantsRunning(this, true)
         try {
             VoiceLockService.start(this)
-            toast("Sunna shuru — ab phrase bolo")
+            toast("Sunna shuru — ab apna phrase bolo")
         } catch (t: Throwable) {
             toast("Start fail: ${t.message}")
         }
-        refresh()
+        updateUi()
+    }
+
+    private fun withMic(action: () -> Unit) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            == PackageManager.PERMISSION_GRANTED
+        ) {
+            action()
+        } else {
+            afterPermission = action
+            micPermission.launch(Manifest.permission.RECORD_AUDIO)
+        }
     }
 
     private fun toggleAdmin() {
@@ -182,21 +298,43 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun refresh() {
-        val parts = buildList {
-            add(if (VoiceLockService.running) "Listening: ON" else "Listening: OFF")
-            add(if (isAccessibilityEnabled()) "Accessibility: ON" else "Accessibility: OFF")
-            add(if (isAdminActive()) "Admin: ON" else "Admin: OFF")
-        }
-        statusText.text = parts.joinToString("   •   ")
+    // --- UI state ---
 
-        modelStatus.text = if (Prefs.hasModel(this)) {
-            "Voice model: ready ✅"
+    private fun updateUi() {
+        val m = model
+        if (m != null) {
+            enrollStatus.text =
+                "Enrolled ✅  •  ${m.templates.size} samples  •  threshold ${fmt(m.threshold)}"
         } else {
-            "Voice model: abhi download nahi hua"
+            enrollStatus.text = if (samples.isNotEmpty()) {
+                "Samples: ${samples.size}/3 — aur record karo"
+            } else {
+                "Abhi enroll nahi hua — 3 samples chahiye"
+            }
         }
-        downloadBtn.isEnabled = !Prefs.hasModel(this) && !downloading
+
+        btnRecord.text = when {
+            busy -> "Recording…"
+            m != null -> "Phir se enroll karo"
+            samples.isNotEmpty() -> "Record sample ${samples.size + 1}/3"
+            else -> "Record sample 1/3"
+        }
+        btnRecord.isEnabled = !busy
+        btnTest.isEnabled = m != null && !busy
+        btnStart.isEnabled = m != null && !busy
+        btnClear.isEnabled = !busy
+
+        val parts = listOf(
+            if (VoiceLockService.running) "Listening: ON" else "Listening: OFF",
+            if (isAccessibilityEnabled()) "Accessibility: ON" else "Accessibility: OFF",
+            if (isAdminActive()) "Admin: ON" else "Admin: OFF"
+        )
+        statusText.text = parts.joinToString("   •   ")
+        btnStop.isEnabled = VoiceLockService.running
     }
+
+    private fun sensitivityText(progress: Int): String =
+        "Sensitivity: $progress%  (zyada = loose, kam = strict)"
 
     private fun isAccessibilityEnabled(): Boolean {
         val am = getSystemService(AccessibilityManager::class.java) ?: return false
@@ -208,6 +346,8 @@ class MainActivity : AppCompatActivity() {
         val dpm = getSystemService(DevicePolicyManager::class.java) ?: return false
         return dpm.isAdminActive(ComponentName(this, AdminReceiver::class.java))
     }
+
+    private fun fmt(value: Double): String = String.format(Locale.US, "%.3f", value)
 
     private fun toast(msg: String) {
         Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
